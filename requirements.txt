@@ -1,0 +1,1 @@
+# Standard library only — this file exists so Railway/Nixpacks detects Python.
