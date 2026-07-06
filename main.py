@@ -31,6 +31,10 @@ PORT = int(os.environ.get("PORT", "8787"))
 HOST = "0.0.0.0" if IS_CLOUD else "127.0.0.1"
 KEY = os.environ.get("DRIX_KEY", "")
 
+# AI synthesis layer — active only when BOTH are set. No defaults on purpose.
+AI_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+AI_MODEL = os.environ.get("OPENROUTER_MODEL_ID", "")
+
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DrixScout/0.4"}
 
 
@@ -285,6 +289,68 @@ def tier_of(score):
         if score >= cutoff:
             return key
     return "interesting"
+
+
+# ---------- AI synthesis (OpenRouter) ----------
+
+AI_PROMPT = """You are a B2B sales-intelligence analyst. Below is a prospect profile and
+recent news items gathered from feeds, ranked by importance. Using ONLY facts present in
+these items (never invent events), produce strict JSON — no markdown, no commentary —
+with exactly these keys:
+
+"read": 2-3 sentence situation read: what is happening around this prospect right now.
+"pain_points": array of {"point": short pain statement, "evidence": the headline(s) that prove it}.
+"questions": array of 5-7 discovery questions to ask in the meeting, each tied to something in the news.
+"drip_campaign": array of 3-5 {"touch": number, "theme": subject-line-style theme, "hook": the specific news fact this touch references}.
+"partner_opportunities": array of opportunities for OTHER, NON-COMPETING solution categories
+  spotted in these items — e.g. a cyberattack in the prospect's industry/region is an opening
+  for backup/recovery partners AND for security partners in that geography. Each:
+  {"signal": the news fact, "solution_category": what kind of solution could ride this,
+   "geography": region it applies to or "national", "notify": who should hear about it,
+   "why": one sentence}.
+
+If a section has nothing grounded in the items, return it as an empty array. JSON only.
+
+PROSPECT PROFILE:
+%s
+
+NEWS ITEMS (importance-ranked, most important first):
+%s"""
+
+
+def ai_synthesize(params, tiers):
+    """One OpenRouter call over the top-ranked items. Fails soft: returns {'error': ...}."""
+    items = []
+    for t in tiers:
+        if t["key"] == "interesting":
+            continue
+        for i in t["items"]:
+            items.append(f"[{t['label']}] ({i['layer']}) {i['date']}: {i['title']}"
+                         + (f" — signals: {', '.join(i['reasons'])}" if i["reasons"] else ""))
+    items = items[:40]
+    if not items:
+        return {"error": "no ranked items to synthesize"}
+    profile = json.dumps({k: v for k, v in params.items() if v and k != "days"})
+    body = json.dumps({
+        "model": AI_MODEL,
+        "messages": [{"role": "user", "content": AI_PROMPT % (profile, "\n".join(items))}],
+        "temperature": 0.4,
+        "max_tokens": 2000,
+    }).encode()
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions", data=body,
+        headers={"Authorization": f"Bearer {AI_KEY}", "Content-Type": "application/json",
+                 "X-Title": "Drix Scout"})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            resp = json.loads(r.read())
+        text = resp["choices"][0]["message"]["content"]
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            return {"error": "model returned no JSON"}
+        return json.loads(m.group(0))
+    except Exception as e:
+        return {"error": str(e)[:200]}
 
 
 def run_brief(params):
