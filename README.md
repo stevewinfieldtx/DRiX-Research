@@ -1,4 +1,4 @@
-# Drix Scout
+# Drix Research
 
 Pre-meeting sales intelligence from free feeds. Fill in whatever you know about
 a prospect — company, person, industry, solution, region, competitors, or just
