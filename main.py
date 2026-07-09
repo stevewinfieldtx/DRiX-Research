@@ -1,10 +1,11 @@
 """
-Drix Scout — pre-meeting research brief generator.
+Drix Research — pre-meeting research brief generator.
 
 Single-file web app. WorldMonitor-style free feed intelligence
-(Google News RSS + institutional press feeds), aimed at a specific prospect.
-Items are scored for importance and presented in four expandable tiers.
-No paid APIs, no dependencies beyond the Python standard library.
+(Google News RSS + institutional press feeds + SEC EDGAR filings + Hacker
+News), aimed at a specific prospect. Items are scored for importance and
+presented in four expandable tiers. No paid APIs, no dependencies beyond
+the Python standard library.
 
 Local:    python main.py            (opens browser at http://localhost:8787)
           python main.py --no-browser
@@ -35,7 +36,12 @@ KEY = os.environ.get("DRIX_KEY", "")
 AI_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 AI_MODEL = os.environ.get("OPENROUTER_MODEL_ID", "")
 
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DrixScout/0.4"}
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DrixResearch/0.5"}
+
+# SEC.gov rejects the browser-spoofed UA above (its fair-access policy requires
+# a self-identifying User-Agent) — set SEC_CONTACT to your email to be a good
+# citizen of their free API; a generic placeholder still works.
+SEC_UA = {"User-Agent": f"DrixResearch/0.5 {os.environ.get('SEC_CONTACT', 'contact-not-set@example.com')}"}
 
 
 def gnews(query, days):
@@ -67,13 +73,13 @@ INDUSTRY_MAP = {
     "health": {
         "sector": ['(hospital OR "health system" OR healthcare) (margins OR staffing OR consolidation)'],
         "regulatory": ['(CMS OR HHS OR FDA) (rule OR policy OR reimbursement)'],
-        "rss": [],
+        "rss": [("FDA", "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml")],
     },
     "tech": {
         "sector": ['("software industry" OR SaaS OR "enterprise software") (spending OR trends)',
                    '(AI OR "artificial intelligence") enterprise adoption'],
         "regulatory": ['(FTC OR "AI regulation" OR "data privacy law")'],
-        "rss": [],
+        "rss": [("FTC", "https://www.ftc.gov/feeds/press-release.xml")],
     },
     "energy": {
         "sector": ['("oil and gas" OR utility OR "power grid") (prices OR demand)'],
@@ -88,27 +94,29 @@ INDUSTRY_MAP = {
     "construct": {
         "sector": ['(construction industry) (costs OR labor OR materials)'],
         "regulatory": ['(OSHA OR "building codes" OR permits) construction'],
-        "rss": [],
+        "rss": [("OSHA", "https://www.osha.gov/news/newsreleases.xml"),
+                ("DOL", "https://www.dol.gov/rss/releases.xml")],
     },
     "manufactur": {
         "sector": ['(manufacturing) (tariffs OR "supply chain" OR reshoring)'],
         "regulatory": ['(OSHA OR EPA OR tariffs) manufacturing'],
-        "rss": [],
+        "rss": [("OSHA", "https://www.osha.gov/news/newsreleases.xml"),
+                ("DOL", "https://www.dol.gov/rss/releases.xml")],
     },
     "logistic": {
         "sector": ['(logistics OR freight OR trucking OR shipping) (rates OR capacity)'],
         "regulatory": ['(FMCSA OR "port fees" OR tariffs) freight'],
-        "rss": [],
+        "rss": [("DOL", "https://www.dol.gov/rss/releases.xml")],
     },
     "retail": {
         "sector": ['(retail) ("consumer spending" OR "foot traffic" OR ecommerce)'],
         "regulatory": ['(FTC OR "swipe fees" OR "consumer protection") retail'],
-        "rss": [],
+        "rss": [("FTC", "https://www.ftc.gov/feeds/press-release.xml")],
     },
     "legal": {
         "sector": ['("law firm" OR "legal industry") (rates OR mergers OR AI)'],
         "regulatory": ['("bar association" OR "legal ethics") rules'],
-        "rss": [],
+        "rss": [("DOJ", "https://www.justice.gov/news/rss?type=press_release")],
     },
 }
 
@@ -150,6 +158,33 @@ def tokens(name):
     return sig if sig else [name.lower()]
 
 
+# ---------- SEC EDGAR: company name -> CIK, for pulling a target's own filings ----------
+
+_CIK_CACHE = {"rows": None}
+
+
+def load_cik_map():
+    """SEC's free static ticker/CIK directory. Fetched once per process, kept in memory."""
+    if _CIK_CACHE["rows"] is None:
+        try:
+            req = urllib.request.Request("https://www.sec.gov/files/company_tickers.json", headers=SEC_UA)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                _CIK_CACHE["rows"] = list(json.loads(r.read()).values())
+        except Exception:
+            _CIK_CACHE["rows"] = []
+    return _CIK_CACHE["rows"]
+
+
+def find_cik(company):
+    sig = tokens(company)
+    if not sig:
+        return None
+    for row in load_cik_map():
+        if all(t in row["title"].lower() for t in sig):
+            return f"{row['cik_str']:010d}"
+    return None
+
+
 def build_feeds(p):
     company = p.get("company", "").strip()
     domain = p.get("domain", "").strip()
@@ -161,40 +196,47 @@ def build_feeds(p):
     days = max(3, min(int(p.get("days", "30") or 30), 365))
 
     prof = industry_profile(industry)
-    feeds = []  # (layer, feed_name, url, must_contain_tokens)
+    feeds = []  # (kind, layer, feed_name, url_or_query, must_contain_tokens)
 
     if company:
         stem = domain.split(".")[0] if domain else ""
         q = f'"{company}"' + (f' OR "{stem}"' if len(stem) > 2 else "")
-        feeds.append(("target", f"Target: {company}", gnews(q, max(days, 30)),
+        feeds.append(("rss", "target", f"Target: {company}", gnews(q, max(days, 30)),
                       tokens(company) + ([stem.lower()] if len(stem) > 2 else [])))
+        feeds.append(("hn", "target", f"HN mentions: {company}", company, tokens(company)))
+        cik = find_cik(company)
+        if cik:
+            edgar = (f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}"
+                     "&type=&dateb=&owner=include&count=20&output=atom")
+            feeds.append(("rss", "target", f"SEC filings: {company}", edgar, []))
     elif domain:
         stem = domain.split(".")[0]
-        feeds.append(("target", f"Target: {domain}", gnews(f'"{stem}"', max(days, 30)),
+        feeds.append(("rss", "target", f"Target: {domain}", gnews(f'"{stem}"', max(days, 30)),
                       [stem.lower()]))
     if person:
-        feeds.append(("person", f"Person: {person}", gnews(f'"{person}"', max(days, 60)),
+        feeds.append(("rss", "person", f"Person: {person}", gnews(f'"{person}"', max(days, 60)),
                       [person.lower().split()[-1]]))
     for i, q in enumerate(prof["sector"]):
-        feeds.append(("sector", f"Sector watch {i + 1}", gnews(q, min(days, 14)), []))
+        feeds.append(("rss", "sector", f"Sector watch {i + 1}", gnews(q, min(days, 14)), []))
     for i, q in enumerate(prof["regulatory"]):
-        feeds.append(("regulatory", f"Regulatory watch {i + 1}", gnews(q, min(days, 30)), []))
+        feeds.append(("rss", "regulatory", f"Regulatory watch {i + 1}", gnews(q, min(days, 30)), []))
     for name, url in prof["rss"]:
-        feeds.append(("regulatory", name, url, []))
+        feeds.append(("rss", "regulatory", name, url, []))
     if region:
         rq = f'({region}) (economy OR business' + (f' OR "{industry}"' if industry else "") + ")"
-        feeds.append(("region", f"Region: {region}", gnews(rq, min(days, 14)), []))
+        feeds.append(("rss", "region", f"Region: {region}", gnews(rq, min(days, 14)), []))
         if industry:
-            feeds.append(("region", f"{region} + {industry}",
+            feeds.append(("rss", "region", f"{region} + {industry}",
                           gnews(f'({region}) ("{industry}") (merger OR acquisition OR expansion OR earnings)', 30), []))
     for comp in competitors:
-        feeds.append(("competitors", f"Competitor: {comp}", gnews(f'"{comp}"', max(days, 30)), tokens(comp)))
+        feeds.append(("rss", "competitors", f"Competitor: {comp}", gnews(f'"{comp}"', max(days, 30)), tokens(comp)))
     if solution:
         anchor = f'"{industry}"' if industry else (f'"{company}"' if company else "")
-        feeds.append(("solution", f"Solution radar: {solution}",
+        feeds.append(("rss", "solution", f"Solution radar: {solution}",
                       gnews(f'"{solution}" {("(" + anchor + ")") if anchor else ""}', 60), []))
-        feeds.append(("solution", "Pain signals",
+        feeds.append(("rss", "solution", "Pain signals",
                       gnews(f'"{solution}" (breach OR outage OR failure OR fine OR lawsuit OR shortage)', 30), []))
+        feeds.append(("hn", "solution", f"HN: {solution}", solution, []))
 
     # Lenses: user-picked "show me this kind of trouble" feeds. Scoped by
     # industry and/or region when given, global otherwise. Full lookback window.
@@ -203,38 +245,87 @@ def build_feeds(p):
     lens_keys = [k for k in p.get("lenses", "").split(",") if k in LENSES]
     for k in lens_keys:
         label, terms = LENSES[k]
-        feeds.append(("lens", f"Lens: {label}", gnews(f"{terms} {lens_anchor}".strip(), days), []))
+        feeds.append(("rss", "lens", f"Lens: {label}", gnews(f"{terms} {lens_anchor}".strip(), days), []))
     custom = p.get("custom_lens", "").strip()
     if custom:
-        feeds.append(("lens", f"Lens: {custom}", gnews(f'"{custom}" {lens_anchor}'.strip(), days), []))
+        feeds.append(("rss", "lens", f"Lens: {custom}", gnews(f'"{custom}" {lens_anchor}'.strip(), days), []))
     return feeds, days
+
+
+def strip_ns(root):
+    """SEC EDGAR serves Atom (namespaced <entry>); Google News/press feeds serve RSS
+    (bare <item>). Stripping namespaces lets one loop below handle both."""
+    for e in root.iter():
+        if "}" in e.tag:
+            e.tag = e.tag.split("}", 1)[1]
+    return root
 
 
 def fetch(layer, name, url, must, limit=15):
     try:
-        req = urllib.request.Request(url, headers=UA)
+        req = urllib.request.Request(url, headers=SEC_UA if "sec.gov" in url else UA)
         with urllib.request.urlopen(req, timeout=15) as r:
-            root = ET.fromstring(r.read())
+            root = strip_ns(ET.fromstring(r.read()))
     except Exception as e:
         return {"layer": layer, "feed": name, "error": str(e)[:120], "items": []}
     items = []
-    for it in root.iter("item"):
+    for it in list(root.iter("item")) + list(root.iter("entry")):
         title = (it.findtext("title") or "").strip()
         if must and not any(t in title.lower() for t in must):
             continue
-        pub = (it.findtext("pubDate") or "").strip()
+        link_el = it.find("link")
+        link = (link_el.get("href") or link_el.text or "") if link_el is not None else ""
+        pub = (it.findtext("pubDate") or it.findtext("updated") or "").strip()
         age_days, date = 999, pub[:16]
+        dt = None
         try:
             dt = parsedate_to_datetime(pub)
+        except Exception:
+            try:
+                dt = datetime.fromisoformat(pub)
+            except Exception:
+                pass
+        if dt:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             date = dt.strftime("%b %d")
             age_days = max(0, (datetime.now(timezone.utc) - dt).days)
-        except Exception:
-            pass
         items.append({"title": title, "source": (it.findtext("source") or "").strip(),
-                      "date": date, "age": age_days, "link": (it.findtext("link") or "").strip()})
+                      "date": date, "age": age_days, "link": link.strip()})
         if len(items) >= limit:
             break
     return {"layer": layer, "feed": name, "items": items}
+
+
+def fetch_hn(layer, name, query, must, limit=10):
+    """Hacker News via Algolia's free, keyless search API. JSON, not RSS."""
+    url = "https://hn.algolia.com/api/v1/search_by_date?tags=story&query=" + urllib.parse.quote_plus(query)
+    try:
+        req = urllib.request.Request(url, headers=UA)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        return {"layer": layer, "feed": name, "error": str(e)[:120], "items": []}
+    items = []
+    for hit in data.get("hits", []):
+        title = (hit.get("title") or "").strip()
+        if not title or (must and not any(t in title.lower() for t in must)):
+            continue
+        link = hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}"
+        age_days, date = 999, ""
+        created = hit.get("created_at_i")
+        if created:
+            dt = datetime.fromtimestamp(created, tz=timezone.utc)
+            date = dt.strftime("%b %d")
+            age_days = max(0, (datetime.now(timezone.utc) - dt).days)
+        items.append({"title": title, "source": "Hacker News", "date": date, "age": age_days, "link": link})
+        if len(items) >= limit:
+            break
+    return {"layer": layer, "feed": name, "items": items}
+
+
+def fetch_any(kind, layer, name, target, must):
+    return fetch_hn(layer, name, target, must) if kind == "hn" else fetch(layer, name, target, must)
 
 
 # ---------- Importance scoring ----------
@@ -340,7 +431,7 @@ def ai_synthesize(params, tiers):
     req = urllib.request.Request(
         "https://openrouter.ai/api/v1/chat/completions", data=body,
         headers={"Authorization": f"Bearer {AI_KEY}", "Content-Type": "application/json",
-                 "X-Title": "Drix Scout"})
+                 "X-Title": "Drix Research"})
     try:
         with urllib.request.urlopen(req, timeout=90) as r:
             resp = json.loads(r.read())
@@ -359,7 +450,7 @@ def run_brief(params):
         return {"error": "Fill in at least one field or pick a lens — any single one works."}
     target_tokens = tokens(params.get("company", "")) if params.get("company", "").strip() else []
     with ThreadPoolExecutor(max_workers=8) as ex:
-        results = list(ex.map(lambda f: fetch(*f), feeds))
+        results = list(ex.map(lambda f: fetch_any(*f), feeds))
     best, errors = {}, []
     for r in results:
         if r.get("error"):
@@ -387,7 +478,7 @@ def run_brief(params):
 PAGE = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Drix Scout</title>
+<title>Drix Research</title>
 <style>
 :root { --bg:#11141a; --panel:#1a1f29; --line:#2c3442; --text:#dde3ec; --dim:#8b95a7;
         --gold:#c9a961; --blue:#6ca0dd; }
@@ -456,7 +547,7 @@ details.tier[open] > summary::before { transform:rotate(90deg); }
 </style></head><body>
 <div class="wrap">
 <aside>
-  <h1>DRIX SCOUT</h1>
+  <h1>DRIX RESEARCH</h1>
   <div class="tag">Pre-meeting intelligence &middot; free feeds only</div>
   <label>Company</label><input id="company" placeholder="North Dallas Bank & Trust">
   <label>Company domain</label><input id="domain" placeholder="ndbt.com">
@@ -483,7 +574,8 @@ details.tier[open] > summary::before { transform:rotate(90deg); }
   <label>Custom lens</label><input id="customlens" placeholder="wire fraud, deposit flight…">
   <label>Lookback</label>
   <select id="days"><option value="7">7 days</option><option value="14">14 days</option>
-    <option value="30" selected>30 days</option><option value="90">90 days</option></select>
+    <option value="30" selected>30 days</option><option value="90">90 days</option>
+    <option value="180">6 months</option><option value="365">1 year</option></select>
   <button id="go" onclick="run()">Generate Brief</button>
   <button id="save" onclick="window.print()">Print / Save as PDF</button>
 </aside>
@@ -553,7 +645,7 @@ window.addEventListener("beforeprint", () =>
 
 DENIED = """<!DOCTYPE html><html><body style="background:#11141a;color:#dde3ec;
 font-family:system-ui;display:grid;place-items:center;min-height:95vh">
-<div style="text-align:center"><h2 style="color:#c9a961">DRIX SCOUT</h2>
+<div style="text-align:center"><h2 style="color:#c9a961">DRIX RESEARCH</h2>
 <p>This instance is key-protected.<br>Open it once as
 <code style="color:#c9a961">https://your-app/?key=YOUR_KEY</code> and you're in.</p>
 </div></body></html>"""
@@ -595,12 +687,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt, *args):
-        print("[scout]", fmt % args)
+        print("[research]", fmt % args)
 
 
 if __name__ == "__main__":
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"Drix Scout running on {HOST}:{PORT}" + ("" if IS_CLOUD else f"  -> http://localhost:{PORT}  (Ctrl+C to stop)"))
+    print(f"Drix Research running on {HOST}:{PORT}" + ("" if IS_CLOUD else f"  -> http://localhost:{PORT}  (Ctrl+C to stop)"))
     if not IS_CLOUD and "--no-browser" not in sys.argv:
         threading.Timer(0.8, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
     server.serve_forever()

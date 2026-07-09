@@ -5,8 +5,12 @@ a prospect — company, person, industry, solution, region, competitors, or just
 a lens like "Breaches" — and get a ranked brief in four importance tiers.
 
 Built on the WorldMonitor feed-curation technique: parameterized Google News
-RSS queries plus institutional press feeds (Federal Reserve, SEC). No paid
-APIs, no API keys, no database. One file, Python standard library only.
+RSS queries plus institutional press feeds (Federal Reserve, SEC, FTC, FDA,
+DOJ, OSHA, DOL — matched to the prospect's industry), the target company's own
+SEC EDGAR filings (via SEC's free CIK directory), and Hacker News mentions. No
+paid APIs, no API keys, no database. One file, Python standard library only.
+
+Lookback window covers 7 days up to 1 year.
 
 ## Run locally
 
@@ -15,7 +19,7 @@ python main.py
 ```
 
 Opens your browser at http://localhost:8787. On Windows, double-click
-`Drix Scout.bat` instead.
+`Drix Research.bat` instead.
 
 ## Deploy to Railway
 
